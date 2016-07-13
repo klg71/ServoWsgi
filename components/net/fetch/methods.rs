@@ -48,6 +48,7 @@ pub fn fetch(request: Rc<Request>) -> Response {
 
 pub fn fetch_with_cors_cache(request: Rc<Request>, cache: &mut CORSCache) -> Response {
 
+    println!("FETCH");
     // Step 1
     if request.window.get() == Window::Client {
         // TODO: Set window to request's client object if client is a Window object
@@ -118,7 +119,7 @@ fn main_fetch(request: Rc<Request>, cache: &mut CORSCache, cors_flag: bool, recu
 
     // Step 1
     let mut response = None;
-
+    println!("{}",request.current_url().scheme());
     // Step 2
     if request.local_urls_only {
         match request.current_url().scheme() {
@@ -173,7 +174,7 @@ fn main_fetch(request: Rc<Request>, cache: &mut CORSCache, cors_flag: bool, recu
                 request.response_tainting.set(ResponseTainting::Opaque);
                 basic_fetch(request.clone(), cache)
 
-            } else if !matches!(current_url.scheme(), "http" | "https") {
+            } else if !matches!(current_url.scheme(), "http" | "https" | "httpsi") {
                 Response::network_error()
 
             } else if request.use_cors_preflight ||
@@ -291,7 +292,6 @@ fn main_fetch(request: Rc<Request>, cache: &mut CORSCache, cors_flag: bool, recu
 fn basic_fetch(request: Rc<Request>, cache: &mut CORSCache) -> Response {
 
     let url = request.current_url();
-
     match url.scheme() {
 
         "about" if url.path() == "blank" => {
@@ -301,7 +301,7 @@ fn basic_fetch(request: Rc<Request>, cache: &mut CORSCache) -> Response {
             response
         },
 
-        "http" | "https" => {
+        "http" | "https" | "httpsi" => {
             http_fetch(request.clone(), cache, false, false, false)
         },
 
@@ -832,6 +832,7 @@ fn http_network_fetch(request: Rc<Request>,
         connector: connection,
     };
     let url = request.current_url();
+    println!("{}",url);
     let cancellation_listener = CancellationListener::new(None);
 
     let wrapped_response = obtain_response(&factory, &url, &request.method.borrow(),

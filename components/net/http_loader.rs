@@ -1,7 +1,13 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+extern crate cpython;
+use self::cpython::Python;
+use self::cpython::ObjectProtocol; //for call method
+//use cpython::PyTuple;
+use self::cpython::PyDict;
 
+use self::cpython::PyObject;
 
 use brotli::Decompressor;
 use connector::Connector;
@@ -40,6 +46,9 @@ use std::boxed::FnBox;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
+use std::fmt::Display;
+use std::borrow::Cow;
+use std::ops::Deref;
 use std::io::{self, Cursor, Read, Write};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock};
@@ -269,6 +278,11 @@ impl HttpRequestFactory for NetworkHttpRequestFactory {
     }
 }
 
+pub struct CustomHttpRequestFactory {
+}
+
+
+
 pub trait HttpRequest {
     type R: HttpResponse + 'static;
 
@@ -307,6 +321,16 @@ impl HttpRequest for WrappedHttpRequest {
         Ok(WrappedHttpResponse { response: response })
     }
 }
+
+pub struct CustomHttpRequest {
+}
+
+//impl HttpRequest for CustomHttpRequest {
+//    type R = ReadableCustomResponse;
+//    fn send (self, body: &Option<Vec<u8>>) -> Result<ReadableCustomResponse,LoadError> {
+ //       Err(
+//    }
+//}
 
 #[derive(Debug)]
 pub struct LoadError {
@@ -681,6 +705,77 @@ pub fn process_response_headers(response: &HttpResponse,
     }
     update_sts_list_from_response(url, response, hsts_list);
 }
+pub fn obtain_local_response<A>(request_factory: &HttpRequestFactory<R=A>,
+                          url: &Url,
+                          method: &Method,
+                          request_headers: &Headers,
+                          cancel_listener: &CancellationListener,
+                          data: &Option<Vec<u8>>,
+                          load_data_method: &Method,
+                          pipeline_id: &Option<PipelineId>,
+                          iters: u32,
+                          devtools_chan: &Option<Sender<DevtoolsControlMsg>>,
+                          request_id: &str)
+                          -> Result<StreamedResponse, LoadError> where A: HttpRequest + 'static {
+    let gil = Python::acquire_gil();
+    let py = gil.python();
+    let environ = PyDict::new(py);
+    environ.set_item(py,"QUERY_STRING","subject=Lukas").unwrap();
+    environ.set_item(py,"PATH_INFO","/").unwrap();
+    environ.set_item(py,"REQUEST_METHOD","GET").unwrap();
+    environ.set_item(py,"SERVER_NAME","127.0.0.1").unwrap();
+    environ.set_item(py,"SERVER_PORT","8000").unwrap();
+    let sys = py.import("sys").unwrap();
+    let path = sys.get(py, "path").unwrap();
+    path.getattr(py,"append").unwrap().call(py, ("/home/lukas/simple_django/simple_project/simple_project/",), None).unwrap();
+    path.getattr(py,"append").unwrap().call(py, ("/home/lukas/simple_django/simple_project/",), None).unwrap();
+    path.getattr(py,"append").unwrap().call(py, ("/home/lukas/simple_django/venv/lib/python3.4/site-packages/",), None).unwrap();
+    let app = py.import("wsgi").unwrap();
+    let answer:PyDict = app.call(py,"call_application",(environ,),None).unwrap().extract(py).unwrap();
+    
+    let step1=answer.get_item(py,"status");
+    let step2 =step1.unwrap();
+    let step5:Cow<'static, str>=get_status(step2.to_string().deref());
+
+    //let statusCode = &step3.to_mut()[1..3];
+
+    println!("{}",answer.get_item(py,"headers").unwrap().get_item(py,0).unwrap());
+    println!("{}",answer.get_item(py,"body").unwrap());
+    let bodybytes= Cursor::new(answer.get_item(py,"body").unwrap().to_string().into_bytes());
+
+    
+    let rawstatus=RawStatus(step5.parse::<u16>().unwrap(),step5);
+    //println!("{}",answer.get_item(py,"status").unwrap());
+    let mut head = Headers::new();
+    let py_dict:PyObject=answer.get_item(py,"headers").unwrap().get_item(py,0).unwrap();
+    let vec_headers=py_dict.iter(py).unwrap();
+
+    for x in vec_headers {
+        //println!("{}",x.unwrap());
+        let obj=x.unwrap();
+        let vec_head=vec![obj.get_item(py,1).unwrap().to_string().into()];
+        head.set_raw(obj.get_item(py,0).unwrap().to_string(),vec_head);
+    }
+
+    let custom_response  = ReadableCustomResponse{body :bodybytes,raw_status:rawstatus,headers:head};
+    let response:Box<HttpResponse> = Box::new(custom_response);
+    let metadata: Metadata = Metadata::default(url.clone());
+
+    Ok(StreamedResponse::from_http_response(response,metadata).unwrap())
+
+}
+
+fn get_status(s:&str) -> Cow<'static, str> {
+    let res;
+    if s.len()>0 {
+        res=s[..3].to_string();
+        res.into()
+    }
+    else {
+        "200".into()
+    }
+}
+
 
 pub fn obtain_response<A>(request_factory: &HttpRequestFactory<R=A>,
                           url: &Url,
@@ -698,7 +793,6 @@ pub fn obtain_response<A>(request_factory: &HttpRequestFactory<R=A>,
     let null_data = None;
     let response;
     let connection_url = replace_hosts(&url);
-
     // loop trying connections in connection pool
     // they may have grown stale (disconnected), in which case we'll get
     // a ConnectionAborted error. this loop tries again with a new
@@ -802,6 +896,7 @@ pub fn load<A, B>(load_data: &LoadData,
     let mut iters = 0;
     // URL of the document being loaded, as seen by all the higher-level code.
     let mut doc_url = load_data.url.clone();
+    println!("{}",doc_url);
     let mut redirected_to = HashSet::new();
     let mut method = load_data.method.clone();
 
@@ -879,6 +974,13 @@ pub fn load<A, B>(load_data: &LoadData,
         //if there is a new auth header then set the request headers with it
         if let Some(ref auth_header) = new_auth_header {
             request_headers.set(auth_header.clone());
+        }
+
+        if let Some(ref m) = doc_url.port() {
+            if *m == 12345 {
+                return obtain_local_response(request_factory,&doc_url,&method,&request_headers,&cancel_listener,&load_data.data,&load_data.method,&load_data.pipeline_id,iters,&devtools_chan,&request_id);
+            }
+            println!("{}",*m);
         }
 
         let response = try!(obtain_response(request_factory, &doc_url, &method, &request_headers,
