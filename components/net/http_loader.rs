@@ -9,6 +9,8 @@ use self::cpython::PyDict;
 
 use self::cpython::PyObject;
 
+
+
 use brotli::Decompressor;
 use connector::Connector;
 use cookie;
@@ -21,7 +23,8 @@ use hyper::Error as HttpError;
 use hyper::client::{Pool, Request, Response};
 use hyper::header::{Accept, AcceptEncoding, ContentLength, ContentEncoding, ContentType, Host, Referer};
 use hyper::header::{Authorization, Basic};
-use hyper::header::{Encoding, Header, Headers, Quality, QualityItem};
+use hyper::header::{Encoding, Header, Headers, Quality, QualityItem,Cookie};
+use hyper::header::CookiePair;
 use hyper::header::{Location, SetCookie, StrictTransportSecurity, UserAgent, qitem};
 use hyper::http::RawStatus;
 use hyper::method::Method;
@@ -42,6 +45,7 @@ use profile_traits::time::{ProfilerCategory, profile, ProfilerChan, TimerMetadat
 use profile_traits::time::{TimerMetadataReflowType, TimerMetadataFrameType};
 use resource_thread::{CancellationListener, send_error, start_sending_sniffed_opt, AuthCache, AuthCacheEntry};
 use std::borrow::ToOwned;
+use std::borrow::Borrow;
 use std::boxed::FnBox;
 use std::collections::HashSet;
 use std::error::Error;
@@ -705,7 +709,7 @@ pub fn process_response_headers(response: &HttpResponse,
     }
     update_sts_list_from_response(url, response, hsts_list);
 }
-pub fn obtain_local_response<A>(request_factory: &HttpRequestFactory<R=A>,
+fn obtain_local_response(
                           url: &Url,
                           method: &Method,
                           request_headers: &Headers,
@@ -716,52 +720,81 @@ pub fn obtain_local_response<A>(request_factory: &HttpRequestFactory<R=A>,
                           iters: u32,
                           devtools_chan: &Option<Sender<DevtoolsControlMsg>>,
                           request_id: &str)
-                          -> Result<StreamedResponse, LoadError> where A: HttpRequest + 'static {
+                          -> Result<ReadableCustomResponse,LoadError> {
     let gil = Python::acquire_gil();
     let py = gil.python();
     let environ = PyDict::new(py);
-    environ.set_item(py,"QUERY_STRING","subject=Lukas").unwrap();
-    environ.set_item(py,"PATH_INFO","/").unwrap();
-    environ.set_item(py,"REQUEST_METHOD","GET").unwrap();
-    environ.set_item(py,"SERVER_NAME","127.0.0.1").unwrap();
-    environ.set_item(py,"SERVER_PORT","8000").unwrap();
+    let header_py = PyDict::new(py); 
+
+    for x in request_headers.iter(){
+        header_py.set_item(py,x.name(),x.value_string());
+    }
+
+    environ.set_item(py,"QUERY_STRING",url.query()).unwrap();
+    environ.set_item(py,"PATH_INFO",url.path()).unwrap();
+    match *method {
+        Method::Get => environ.set_item(py,"REQUEST_METHOD","GET").unwrap(),
+        Method::Post => environ.set_item(py,"REQUEST_METHOD","POST").unwrap(),
+        Method::Put => environ.set_item(py,"REQUEST_METHOD","PUT").unwrap(),
+        Method::Options => environ.set_item(py,"REQUEST_METHOD","OPTIONS").unwrap(),
+        Method::Delete => environ.set_item(py,"REQUEST_METHOD","DELETE").unwrap(),
+        Method::Head => environ.set_item(py,"REQUEST_METHOD","HEAD").unwrap(),
+        Method::Trace => environ.set_item(py,"REQUEST_METHOD","TRACE").unwrap(),
+        Method::Connect => environ.set_item(py,"REQUEST_METHOD","CONNECT").unwrap(),
+        Method::Patch => environ.set_item(py,"REQUEST_METHOD","PATCH").unwrap(),
+        Method::Extension(_) => environ.set_item(py,"REQUEST_METHOD","EXTENSION").unwrap(),
+    }
+    environ.set_item(py,"SERVER_NAME",url.host().unwrap().to_string()).unwrap();
+    environ.set_item(py,"SERVER_PORT",url.port().unwrap().to_string()).unwrap();
     let sys = py.import("sys").unwrap();
     let path = sys.get(py, "path").unwrap();
     path.getattr(py,"append").unwrap().call(py, ("/home/lukas/simple_django/simple_project/simple_project/",), None).unwrap();
     path.getattr(py,"append").unwrap().call(py, ("/home/lukas/simple_django/simple_project/",), None).unwrap();
     path.getattr(py,"append").unwrap().call(py, ("/home/lukas/simple_django/venv/lib/python3.4/site-packages/",), None).unwrap();
     let app = py.import("wsgi").unwrap();
-    let answer:PyDict = app.call(py,"call_application",(environ,),None).unwrap().extract(py).unwrap();
-    
+    match data.clone() {
+        Some(x) => println!("{}",String::from_utf8(x).unwrap()),
+        None => println!("{}","No Post Data")
+    }
+
+    let answer:PyDict=    match data.clone() {
+        Some(x) => app.call(py,"call_application",(environ,String::from_utf8(x).unwrap(),header_py),None).unwrap().extract(py).unwrap(),
+        None => app.call(py,"call_application",(environ,data,header_py),None).unwrap().extract(py).unwrap()
+    };
+        
     let step1=answer.get_item(py,"status");
     let step2 =step1.unwrap();
     let step5:Cow<'static, str>=get_status(step2.to_string().deref());
 
-    //let statusCode = &step3.to_mut()[1..3];
 
-    println!("{}",answer.get_item(py,"headers").unwrap().get_item(py,0).unwrap());
-    println!("{}",answer.get_item(py,"body").unwrap());
+    //println!("{}",answer.get_item(py,"body").unwrap());
     let bodybytes= Cursor::new(answer.get_item(py,"body").unwrap().to_string().into_bytes());
 
     
     let rawstatus=RawStatus(step5.parse::<u16>().unwrap(),step5);
-    //println!("{}",answer.get_item(py,"status").unwrap());
     let mut head = Headers::new();
     let py_dict:PyObject=answer.get_item(py,"headers").unwrap().get_item(py,0).unwrap();
     let vec_headers=py_dict.iter(py).unwrap();
 
     for x in vec_headers {
-        //println!("{}",x.unwrap());
         let obj=x.unwrap();
         let vec_head=vec![obj.get_item(py,1).unwrap().to_string().into()];
         head.set_raw(obj.get_item(py,0).unwrap().to_string(),vec_head);
+//      let out:Vec<u8> = obj.get_item(py,1).unwrap().to_string().into_bytes();
+        if obj.get_item(py,0).unwrap().to_string()=="Set-Cookie" {
+            head.set(Cookie(vec![CookiePair::new(obj.get_item(py,0).unwrap().to_string(),obj.get_item(py,1).unwrap().to_string())]));
+        } else { 
+            let vec_head=vec![obj.get_item(py,1).unwrap().to_string().into()];
+            head.set_raw(obj.get_item(py,0).unwrap().to_string(),vec_head);
+        }
     }
 
     let custom_response  = ReadableCustomResponse{body :bodybytes,raw_status:rawstatus,headers:head};
-    let response:Box<HttpResponse> = Box::new(custom_response);
+    //let response1:HttpResponse = custom_response;
+    //let response:Box<HttpResponse> = Box::new(custom_response);
     let metadata: Metadata = Metadata::default(url.clone());
 
-    Ok(StreamedResponse::from_http_response(response,metadata).unwrap())
+    Ok(custom_response)
 
 }
 
@@ -975,19 +1008,22 @@ pub fn load<A, B>(load_data: &LoadData,
         if let Some(ref auth_header) = new_auth_header {
             request_headers.set(auth_header.clone());
         }
-
-        if let Some(ref m) = doc_url.port() {
+        let response:Box<HttpResponse> = if let Some(ref m) = doc_url.port() {
             if *m == 12345 {
-                return obtain_local_response(request_factory,&doc_url,&method,&request_headers,&cancel_listener,&load_data.data,&load_data.method,&load_data.pipeline_id,iters,&devtools_chan,&request_id);
-            }
-            println!("{}",*m);
-        }
-
-        let response = try!(obtain_response(request_factory, &doc_url, &method, &request_headers,
+                Box::new(obtain_local_response(&doc_url,&method,&request_headers,&cancel_listener,&load_data.data,&load_data.method,&load_data.pipeline_id,iters,&devtools_chan,&request_id).unwrap())
+            } else {
+             Box::new(try!(obtain_response(request_factory, &doc_url, &method, &request_headers,
                                             &cancel_listener, &load_data.data, &load_data.method,
-                                            &load_data.pipeline_id, iters, &devtools_chan, &request_id));
+                                            &load_data.pipeline_id, iters, &devtools_chan, &request_id)))
 
-        process_response_headers(&response, &doc_url, &http_state.cookie_jar, &http_state.hsts_list, &load_data);
+            }
+        }
+        else {
+          Box::new(try!(obtain_response(request_factory, &doc_url, &method, &request_headers,
+                                            &cancel_listener, &load_data.data, &load_data.method,
+                                            &load_data.pipeline_id, iters, &devtools_chan, &request_id)))
+        };
+        process_response_headers(response.borrow(), &doc_url, &http_state.cookie_jar, &http_state.hsts_list, &load_data);
 
         //if response status is unauthorized then prompt user for username and password
         if response.status() == StatusCode::Unauthorized &&
@@ -1084,7 +1120,7 @@ pub fn load<A, B>(load_data: &LoadData,
                     metadata.headers.clone(), metadata.status.clone(),
                     pipeline_id);
          }
-        return StreamedResponse::from_http_response(box response, metadata)
+        return StreamedResponse::from_http_response(response, metadata)
     }
 }
 
